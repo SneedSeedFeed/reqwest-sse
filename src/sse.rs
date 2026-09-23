@@ -20,6 +20,7 @@ pub struct SseEvent {
 #[derive(Debug)]
 struct EventState {
     data: String,
+    has_data: bool,
     event: Option<String>,
     id: Option<String>,
     retry: Option<u64>,
@@ -29,6 +30,7 @@ impl EventState {
     fn new() -> Self {
         Self {
             data: String::new(),
+            has_data: false,
             event: None,
             id: None,
             retry: None,
@@ -37,30 +39,36 @@ impl EventState {
 
     fn reset(&mut self) {
         self.data.clear();
+        self.has_data = false;
         self.event = None;
-        self.id = None;
+        // self.id = None;
         self.retry = None;
     }
 
     fn build_event(&mut self) -> Option<SseEvent> {
-        if self.data.is_empty() {
+        if !self.has_data {
             self.reset();
             return None;
         }
 
-        Some(SseEvent {
+        let event = SseEvent {
             data: std::mem::take(&mut self.data),
             event: self.event.take(),
-            id: self.id.take(),
+            id: self.id.clone(),
             retry: self.retry.take(),
-        })
+        };
+
+        self.has_data = false;
+
+        Some(event)
     }
 
     fn push_data(&mut self, value: &str) {
-        if !self.data.is_empty() {
+        if self.has_data {
             self.data.push('\n');
         }
         self.data.push_str(value);
+        self.has_data = true;
     }
 }
 
@@ -72,6 +80,10 @@ pin_project! {
         inner: S,
         buffer: BytesMut,
         state: EventState,
+        // where to scan for EOL from (to avoid re-scanning)
+        scan_pos: usize,
+        // have we seen and skipped past the byte order mark yet?
+        bom_handled: bool,
         done: bool,
     }
 }
@@ -86,6 +98,8 @@ where
             inner: stream,
             buffer: BytesMut::new(),
             state: EventState::new(),
+            scan_pos: 0,
+            bom_handled: false,
             done: false,
         }
     }
@@ -110,18 +124,18 @@ where
             None => (line, &b""[..]),
         };
 
-        let field = std::str::from_utf8(field_bytes).map_err(crate::error::decode)?;
+        //let field = std::str::from_utf8(field_bytes).map_err(crate::error::decode)?;
         let value = std::str::from_utf8(value_bytes).map_err(crate::error::decode)?;
 
-        match field {
-            "data" => state.push_data(value),
-            "event" => state.event = Some(value.to_string()),
-            "id" => {
+        match field_bytes {
+            b"data" => state.push_data(value),
+            b"event" => state.event = Some(value.to_string()),
+            b"id" => {
                 if !value.contains('\0') {
                     state.id = Some(value.to_string());
                 }
             }
-            "retry" => {
+            b"retry" => {
                 if let Ok(retry) = value.parse::<u64>() {
                     state.retry = Some(retry);
                 }
@@ -135,22 +149,53 @@ where
     fn poll_event_from_buffer(
         state: &mut EventState,
         buffer: &mut BytesMut,
+        scan_pos: &mut usize,
+        bom_handled: &mut bool,
     ) -> crate::Result<Option<SseEvent>> {
+        if !*bom_handled {
+            match buffer.as_ref() {
+                [0xEF, 0xBB, 0xBF, ..] => {
+                    buffer.split_to(3);
+                    *bom_handled = true;
+                }
+                [0xEF] | [0xEF, 0xBB] => return Ok(None),
+                _ => *bom_handled = true,
+            }
+        }
+
         loop {
-            let newline = buffer.iter().position(|&b| b == b'\n');
-            let Some(pos) = newline else {
-                return Ok(None);
-            };
+            while *scan_pos < buffer.len() {
+                let pos = *scan_pos;
 
-            let line_bytes = buffer.split_to(pos + 1);
-            let mut line = &line_bytes[..pos];
-            if line.last() == Some(&b'\r') {
-                line = &line[..line.len() - 1];
+                let line_end = match buffer[pos] {
+                    b'\n' => Some(pos + 1),
+                    b'\r' if pos + 1 == buffer.len() => {
+                        // this could be CR or CRLF and we need more data to prove it
+                        return Ok(None);
+                    }
+                    b'\r' if buffer[pos + 1] == b'\n' => Some(pos + 2),
+                    b'\r' => Some(pos + 1),
+                    _ => {
+                        *scan_pos += 1;
+                        None
+                    }
+                };
+
+                let Some(line_end) = line_end else {
+                    continue;
+                };
+
+                let line_bytes = buffer.split_to(line_end);
+                *scan_pos = 0;
+
+                let line = &line_bytes[..pos];
+
+                if let Some(event) = Self::process_line(state, line)? {
+                    return Ok(Some(event));
+                }
             }
 
-            if let Some(event) = Self::process_line(state, line)? {
-                return Ok(Some(event));
-            }
+            return Ok(None);
         }
     }
 }
@@ -169,7 +214,12 @@ where
         }
 
         loop {
-            match Self::poll_event_from_buffer(this.state, this.buffer) {
+            match Self::poll_event_from_buffer(
+                this.state,
+                this.buffer,
+                this.scan_pos,
+                this.bom_handled,
+            ) {
                 Ok(Some(event)) => return Poll::Ready(Some(Ok(event))),
                 Ok(None) => {}
                 Err(err) => {
@@ -189,9 +239,6 @@ where
                 }
                 Poll::Ready(None) => {
                     *this.done = true;
-                    if let Some(event) = this.state.build_event() {
-                        return Poll::Ready(Some(Ok(event)));
-                    }
                     return Poll::Ready(None);
                 }
             }
